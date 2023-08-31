@@ -1,0 +1,2846 @@
+From 1e3c9bb9e37c8baaea4dd1befca57c3968063e5d Mon Sep 17 00:00:00 2001
+From: Gui-Yue <yuemeng.gui@gmail.com>
+Date: Fri, 20 Jan 2023 08:52:51 +0000
+Subject: [PATCH 2/2] fix build failure caused by imageio not found.
+
+---
+ src/apps/CMakeLists.txt                       |   8 +-
+ src/apps/ocioconvert/CMakeLists.txt           |  22 +-
+ src/apps/ocioconvert/main.cpp                 | 482 +++++++-----------
+ src/apps/ociodisplay/CMakeLists.txt           |  48 +-
+ src/apps/ociodisplay/main.cpp                 | 194 ++++---
+ src/apps/ociolutimage/CMakeLists.txt          |  16 +-
+ src/apps/ociolutimage/main.cpp                | 186 +++----
+ src/apputils/CMakeLists.txt                   |  15 +-
+ src/libutils/CMakeLists.txt                   |   6 +-
+ src/libutils/imageioapphelpers/CMakeLists.txt |  49 ++
+ src/libutils/imageioapphelpers/imageio.cpp    | 228 +++++++++
+ src/libutils/imageioapphelpers/imageio.h      |  84 +++
+ .../imageioapphelpers/imageio_exr.cpp         | 416 +++++++++++++++
+ .../imageioapphelpers/imageio_oiio.cpp        | 270 ++++++++++
+ 14 files changed, 1438 insertions(+), 586 deletions(-)
+ create mode 100644 src/libutils/imageioapphelpers/CMakeLists.txt
+ create mode 100644 src/libutils/imageioapphelpers/imageio.cpp
+ create mode 100644 src/libutils/imageioapphelpers/imageio.h
+ create mode 100644 src/libutils/imageioapphelpers/imageio_exr.cpp
+ create mode 100644 src/libutils/imageioapphelpers/imageio_oiio.cpp
+
+--- a/src/apps/CMakeLists.txt
++++ b/src/apps/CMakeLists.txt
+@@ -8,14 +8,14 @@
+ 	add_subdirectory(ociomakeclf)
+ 	add_subdirectory(ociowrite)
+ 
+-	if(OpenImageIO_FOUND AND TARGET OpenImageIO::OpenImageIO)
++if(TARGET OpenColorIO::ImageIOBackend)
+ 		add_subdirectory(ociolutimage)
+ 		add_subdirectory(ocioconvert)
+ 		add_subdirectory(ociodisplay)
+ 		add_subdirectory(ocioperf)
+ 	else()
+-		message(WARNING "Could NOT find OpenImageIO. Skipping build for ociolutimage, ocioconvert, ociodisplay and ocioperf.")
++		message(WARNING "Could NOT find OpenImageIO or OpenEXR. Skipping build for ociolutimage, ocioconvert and ociodisplay.")
+ 	endif()
+ else()
+ 	message(WARNING "Skipping build of all apps.")
+-endif()
+\ No newline at end of file
++endif()
+--- a/src/apps/ocioconvert/CMakeLists.txt
++++ b/src/apps/ocioconvert/CMakeLists.txt
+@@ -14,23 +14,23 @@
+ 
+ add_executable(ocioconvert ${SOURCES})
+ 
+-if(NOT BUILD_SHARED_LIBS)
+-    target_compile_definitions(ocioconvert
+-        PRIVATE
+-            OpenColorIO_SKIP_IMPORTS
+-    )
+-endif()
++set_target_properties(ocioconvert PROPERTIES
++    COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS}"
++)
+ 
+-set_target_properties(ocioconvert PROPERTIES 
+-    COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS}")
++if (USE_MSVC)
++	# Temporary until fixed in OpenImageIO: Mute some warnings from OpenImageIO farmhash.h
++	# C4267 (level 3)	    'var' : conversion from 'size_t' to 'type', possible loss of data
++	# C4244	(level 3 & 4)	'conversion' conversion from 'type1' to 'type2', possible loss of data
++    target_compile_options(ocioconvert PRIVATE /wd4267 /wd4244)
++endif()
+ 
+ target_link_libraries(ocioconvert
+     PRIVATE
+-        apputils
+         ${OCIO_GL_LIB}
+-        oiiohelpers
++        apputils
++        imageioapphelpers
+         OpenColorIO
+-        OpenImageIO::OpenImageIO
+ )
+ 
+ install(TARGETS ocioconvert
+--- a/src/apps/ocioconvert/main.cpp
++++ b/src/apps/ocioconvert/main.cpp
+@@ -11,57 +11,36 @@
+ #include <OpenColorIO/OpenColorIO.h>
+ namespace OCIO = OCIO_NAMESPACE;
+ 
+-#include <OpenImageIO/imageio.h>
+-#include <OpenImageIO/typedesc.h>
+-
+-// Take the half.h the same way OpenImageIO takes it i.e. do not use the Imath/OpenEXR one from
+-// OpenColorIO to avoid version clashes between OpenColorIO & OpenImageIO libraries. For example,
+-// OpenColorIO uses Imath 3.1.x but OpenImageIO (from the system) is using Imath 3.0.x which
+-// breaks the OpenColorIO compilation.
+-#if (OIIO_VERSION >= 20200)
+-#   include <OpenImageIO/Imath.h>
+-#else
+-#   include <OpenEXR/half.h>
+-#endif
+-#if (OIIO_VERSION < 10100)
+-namespace OIIO = OIIO_NAMESPACE;
+-#endif
+-
+ #include "apputils/argparse.h"
+ 
+ #ifdef OCIO_GPU_ENABLED
+ #include "oglapp.h"
+ #endif // OCIO_GPU_ENABLED
+ 
+-#include "oiiohelpers.h"
+-
++#include "imageio.h"
+ 
+ // Array of non OpenColorIO arguments.
+ static std::vector<std::string> args;
+ 
+ // Fill 'args' array with OpenColorIO arguments.
+-static int
+-parse_end_args(int argc, const char *argv[])
++static int parse_end_args(int argc, const char *argv[])
+ {
+-  while(argc>0)
+-  {
+-    args.push_back(argv[0]);
+-    argc--;
+-    argv++;
+-  }
++    while (argc>0)
++    {
++        args.push_back(argv[0]);
++        argc--;
++        argv++;
++    }
+ 
+-  return 0;
++    return 0;
+ }
+ 
+-bool ParseNameValuePair(std::string& name, std::string& value,
+-                        const std::string& input);
++bool ParseNameValuePair(std::string& name, std::string& value, const std::string& input);
+ 
+ bool StringToFloat(float * fval, const char * str);
+ 
+ bool StringToInt(int * ival, const char * str);
+ 
+-bool StringToVector(std::vector<int> * ivector, const char * str);
+-
+ int main(int argc, const char **argv)
+ {
+     ArgParse ap;
+@@ -69,9 +48,7 @@
+     std::vector<std::string> floatAttrs;
+     std::vector<std::string> intAttrs;
+     std::vector<std::string> stringAttrs;
+-    std::string keepChannels;
+ 
+-    bool croptofull     = false;
+     bool usegpu         = false;
+     bool usegpuLegacy   = false;
+     bool outputgpuInfo  = false;
+@@ -79,32 +56,34 @@
+     bool help           = false;
+     bool useLut         = false;
+     bool useDisplayView = false;
++    bool useInvertView  = false;
+ 
+     ap.options("ocioconvert -- apply colorspace transform to an image \n\n"
+-               "usage: ocioconvert [options]  inputimage inputcolorspace outputimage outputcolorspace\n"
++               "usage: ocioconvert [options] inputimage inputcolorspace outputimage outputcolorspace\n"
+                "   or: ocioconvert [options] --lut lutfile inputimage outputimage\n"
+-               "   or: ocioconvert [options] --view inputimage inputcolorspace outputimage displayname viewname\n\n",
++               "   or: ocioconvert [options] --view inputimage inputcolorspace outputimage displayname viewname\n"
++               "   or: ocioconvert [options] --invertview inputimage displayname viewname outputimage outputcolorspace\n\n",
+                "%*", parse_end_args, "",
+                "<SEPARATOR>", "Options:",
+-               "--lut",       &useLut,         "Convert using a LUT rather than a config file",
+-               "--view",      &useDisplayView, "Convert to a (display,view) pair rather than to "
+-                                               "an output color space",
+-               "--gpu",       &usegpu,         "Use GPU color processing instead of CPU (CPU is the default)",
+-               "--gpulegacy", &usegpuLegacy,   "Use the legacy (i.e. baked) GPU color processing "
+-                                               "instead of the CPU one (--gpu is ignored)",
+-               "--gpuinfo",  &outputgpuInfo,   "Output the OCIO shader program",
+-               "--help",     &help,            "Print help message",
+-               "-v" ,        &verbose,         "Display general information",
+-               "<SEPARATOR>", "\nOpenImageIO options:",
++               "--lut",         &useLut,            "Convert using a LUT rather than a config file",
++               "--view",        &useDisplayView,    "Convert to a (display,view) pair rather than to "
++                                                    "an output color space",
++               "--invertview",  &useInvertView,     "Convert from a (display,view) pair rather than "
++                                                    "from a color space",
++               "--gpu",         &usegpu,            "Use GPU color processing instead of CPU (CPU is the default)",
++               "--gpulegacy",   &usegpuLegacy,      "Use the legacy (i.e. baked) GPU color processing "
++                                                    "instead of the CPU one (--gpu is ignored)",
++               "--gpuinfo",     &outputgpuInfo,     "Output the OCIO shader program",
++               "--h",           &help,              "Display the help and exit",
++               "--help",        &help,              "Display the help and exit",
++               "-v" ,           &verbose,           "Display general information",
++               "<SEPARATOR>", "\nOpenImageIO or OpenEXR options:",
+                "--float-attribute %L",  &floatAttrs,   "\"name=float\" pair defining OIIO float attribute "
+                                                        "for outputimage",
+-               "--int-attribute %L",    &intAttrs,     "\"name=int\" pair defining OIIO int attribute "
++               "--int-attribute %L",    &intAttrs,     "\"name=int\" pair defining an int attribute "
+                                                        "for outputimage",
+-               "--string-attribute %L", &stringAttrs,  "\"name=string\" pair defining OIIO string attribute "
++               "--string-attribute %L", &stringAttrs,  "\"name=string\" pair defining a string attribute "
+                                                        "for outputimage",
+-               "--croptofull",          &croptofull,   "Crop or pad to make pixel data region match the "
+-                                                       "\"full\" region",
+-               "--ch %s",               &keepChannels, "Select channels (e.g., \"2,3,4\")",
+                NULL
+                );
+ 
+@@ -138,7 +117,7 @@
+     const char * display          = nullptr;
+     const char * view             = nullptr;
+ 
+-    if (!useLut && !useDisplayView)
++    if (!useLut && !useDisplayView && !useInvertView)
+     {
+         if (args.size() != 4)
+         {
+@@ -186,14 +165,35 @@
+         display         = args[3].c_str();
+         view            = args[4].c_str();
+     }
++    else if (useDisplayView && useInvertView)
++    {
++        std::cerr << "ERROR: Options view & invertview can't be used at the same time." << std::endl;
++        ap.usage();
++        exit(1);
++    }
++    else if (useInvertView) 
++    {
++        if (args.size() != 5)
++        {
++            std::cerr << "ERROR: Expecting 5 arguments for --invertview option, found "
++                      << args.size() << "." << std::endl;
++            ap.usage();
++            exit(1);
++        }
++        inputimage          = args[0].c_str();
++        display             = args[1].c_str();
++        view                = args[2].c_str();
++        outputimage         = args[3].c_str();
++        outputcolorspace    = args[4].c_str();
++    }
+ 
+-    if(verbose)
++    if (verbose)
+     {
+         std::cout << std::endl;
+-        std::cout << "OIIO Version: " << OIIO_VERSION_STRING << std::endl;
++        std::cout << OCIO::ImageIO::GetVersion() << std::endl;
+         std::cout << "OCIO Version: " << OCIO::GetVersion() << std::endl;
+         const char * env = OCIO::GetEnvVariable("OCIO");
+-        if(env && *env && !useLut)
++        if (env && *env && !useLut)
+         {
+             try
+             {
+@@ -209,10 +209,10 @@
+                 std::cout << "ERROR loading config file: " << e.what() << std::endl;
+                 exit(1);
+             }
+-            catch(...)
++            catch (...)
+             {
+ 
+-                std::cerr << "ERROR loading the config file: '" << env << "'";
++                std::cerr << "ERROR loading config file: '" << env << "'" << std::endl;
+                 exit(1);
+             }
+         }
+@@ -229,181 +229,33 @@
+         std::cout << "Using GPU color processing." << std::endl;
+     }
+ 
+-    OIIO::ImageSpec spec;
+-    OCIO::ImgBuffer img;
+-    int imgwidth = 0;
+-    int imgheight = 0;
+-    int components = 0;
++    OCIO::ImageIO imgInput;
++    OCIO::ImageIO imgOutputCPU;
++    // Default is to perform in-place conversion.
++    OCIO::ImageIO *imgOutput = &imgInput;
+ 
+     // Load the image.
+     std::cout << std::endl;
+     std::cout << "Loading " << inputimage << std::endl;
+     try
+     {
+-#if OIIO_VERSION < 10903
+-        OIIO::ImageInput* f = OIIO::ImageInput::create(inputimage);
+-#else
+-        auto f = OIIO::ImageInput::create(inputimage);
+-#endif
+-        if(!f)
+-        {
+-            std::cerr << "ERROR: Could not create image input." << std::endl;
+-            exit(1);
+-        }
+-
+-        f->open(inputimage, spec);
+-
+-        std::string error = f->geterror();
+-        if(!error.empty())
+-        {
+-            std::cerr << "ERROR: Could not load image: " << error << std::endl;
+-            exit(1);
+-        }
+-
+-        OCIO::PrintImageSpec(spec, verbose);
+-
+-        imgwidth = spec.width;
+-        imgheight = spec.height;
+-        components = spec.nchannels;
+-
+         if (usegpu || usegpuLegacy)
+         {
+-            spec.format = OIIO::TypeDesc::FLOAT;
+-            img.allocate(spec);
+-
+-            const bool ok = f->read_image(spec.format, img.getBuffer());
+-            if(!ok)
+-            {
+-                std::cerr << "ERROR: Reading \"" << inputimage << "\" failed with: "
+-                          << f->geterror() << "." << std::endl;
+-                exit(1);
+-            }
+-
+-            if(croptofull)
+-            {
+-                std::cerr << "ERROR: Crop disabled in GPU mode." << std::endl;
+-                exit(1);
+-            }
++            imgInput.read(inputimage, OCIO::BIT_DEPTH_F32);
+         }
+         else
+         {
+-            img.allocate(spec);
+-
+-            const bool ok = f->read_image(spec.format, img.getBuffer());
+-            if(!ok)
+-            {
+-                std::cerr << "ERROR: Reading \"" << inputimage << "\" failed with: "
+-                          << f->geterror() << "." << std::endl;
+-                exit(1);
+-            }
++            imgInput.read(inputimage);
+         }
+ 
+-#if OIIO_VERSION < 10903
+-        OIIO::ImageInput::destroy(f);
+-#endif
+-
+-        std::vector<int> kchannels;
+-        //parse --ch argument.
+-        if (keepChannels != "" && !StringToVector(&kchannels, keepChannels.c_str()))
+-        {
+-            std::cerr << "ERROR: --ch: '" << keepChannels
+-                      << "' should be comma-seperated integers." << std::endl;
+-            exit(1);
+-        }
+-
+-        //if kchannels not specified, then keep all channels.
+-        if (kchannels.size() == 0)
+-        {
+-            kchannels.resize(components);
+-            for (int channel=0; channel < components; channel++)
+-            {
+-                kchannels[channel] = channel;
+-            }
+-        }
+-
+-        if (croptofull)
+-        {
+-            imgwidth = spec.full_width;
+-            imgheight = spec.full_height;
+-
+-            std::cout << "cropping to " << imgwidth
+-                      << "x" << imgheight << std::endl;
+-        }
+-
+-        if (croptofull || (int)kchannels.size() < spec.nchannels)
+-        {
+-            // Redefine the spec so it matches the new bounding box.
+-            OIIO::ImageSpec croppedSpec = spec;
+-
+-            croppedSpec.x = 0;
+-            croppedSpec.y = 0;
+-            croppedSpec.height    = imgheight;
+-            croppedSpec.width     = imgwidth;
+-            croppedSpec.nchannels = (int)(kchannels.size());
+-
+-            OCIO::ImgBuffer croppedImg(croppedSpec);
+-
+-            void * croppedBuf = croppedImg.getBuffer();
+-            void * imgBuf     = img.getBuffer();
+-
+-            // crop down bounding box and ditch all but n channels.
+-            // img is a flattened 3 dimensional matrix heightxwidthxchannels.
+-            // fill croppedimg with only the needed pixels.
+-            for (int y=0 ; y < spec.height ; y++)
+-            {
+-                for (int x=0 ; x < spec.width; x++)
+-                {
+-                    for (int k=0; k < (int)kchannels.size(); k++)
+-                    {
+-                        int channel = kchannels[k];
+-                        int current_pixel_y = y + spec.y;
+-                        int current_pixel_x = x + spec.x;
+-
+-                        if (current_pixel_y >= 0 &&
+-                            current_pixel_x >= 0 &&
+-                            current_pixel_y < imgheight &&
+-                            current_pixel_x < imgwidth)
+-                        {
+-                            const size_t imgIdx = (y * spec.width * components) 
+-                                                    + (x * components) + channel;
+-
+-                            const size_t cropIdx = (current_pixel_y * imgwidth * kchannels.size())
+-                                                    + (current_pixel_x * kchannels.size())
+-                                                    + channel;
+-
+-                            if(spec.format==OIIO::TypeDesc::FLOAT)
+-                            {
+-                                ((float*)croppedBuf)[cropIdx] = ((float*)imgBuf)[imgIdx];
+-                            }
+-                            else if(spec.format==OIIO::TypeDesc::HALF)
+-                            {
+-                                ((half*)croppedBuf)[cropIdx] = ((half*)imgBuf)[imgIdx];
+-                            }
+-                            else if(spec.format==OIIO::TypeDesc::UINT16)
+-                            {
+-                                ((uint16_t*)croppedBuf)[cropIdx] = ((uint16_t*)imgBuf)[imgIdx];
+-                            }
+-                            else if(spec.format==OIIO::TypeDesc::UINT8)
+-                            {
+-                                ((uint8_t*)croppedBuf)[cropIdx] = ((uint8_t*)imgBuf)[imgIdx];
+-                            }
+-                            else
+-                            {
+-                                std::cerr << "ERROR: Unsupported image type: " 
+-                                          << spec.format << "." << std::endl;
+-                                exit(1);
+-                            }
+-                        }
+-                    }
+-                }
+-            }
+-
+-            components = (int)(kchannels.size());
+-
+-            img = std::move(croppedImg);
+-        }
++        std::cout << imgInput.getImageDescStr() << std::endl;
++    }
++    catch (const std::exception & e)
++    {
++        std::cerr << "ERROR: Loading file failed: " << e.what() << std::endl;
++        exit(1);
+     }
+-    catch(...)
++    catch (...)
+     {
+         std::cerr << "ERROR: Loading file failed." << std::endl;
+         exit(1);
+@@ -416,17 +268,18 @@
+     if (usegpu || usegpuLegacy)
+     {
+         OCIO::OglApp::Components comp = OCIO::OglApp::COMPONENTS_RGBA;
+-        if (components == 4)
++        if (imgInput.getNumChannels() == 4)
+         {
+             comp = OCIO::OglApp::COMPONENTS_RGBA;
+         }
+-        else if (components == 3)
++        else if (imgInput.getNumChannels() == 3)
+         {
+             comp = OCIO::OglApp::COMPONENTS_RGB;
+         }
+         else
+         {
+-            std::cerr << "Cannot convert image with " << components << " components." << std::endl;
++            std::cerr << "Cannot convert image with " << imgInput.getNumChannels()
++                      << " components." << std::endl;
+             exit(1);
+         }
+ 
+@@ -447,7 +300,7 @@
+ 
+         oglApp->setPrintShader(outputgpuInfo);
+ 
+-        oglApp->initImage(imgwidth, imgheight, comp, (float *)img.getBuffer());
++        oglApp->initImage(imgInput.getWidth(), imgInput.getHeight(), comp, (float *)imgInput.getData());
+         
+         oglApp->createGLBuffers();
+     }
+@@ -482,6 +335,14 @@
+                 t->setView(view);
+                 processor = config->getProcessor(t);
+             }
++            else if (useInvertView)
++            {
++                OCIO::DisplayViewTransformRcPtr t = OCIO::DisplayViewTransform::Create();
++                t->setSrc(outputcolorspace);
++                t->setDisplay(display);
++                t->setView(view);
++                processor = config->getProcessor(t, OCIO::TRANSFORM_DIR_INVERSE);
++            }
+             else
+             {
+                 processor = config->getProcessor(inputcolorspace, outputcolorspace);
+@@ -511,26 +372,74 @@
+             gpu->extractGpuShaderInfo(shaderDesc);
+ 
+             oglApp->setShader(shaderDesc);
+-            oglApp->reshape(imgwidth, imgheight);
++            oglApp->reshape(imgInput.getWidth(), imgInput.getHeight());
+             oglApp->redisplay();
+-            oglApp->readImage((float *)img.getBuffer());
++            oglApp->readImage((float *)imgInput.getData());
+         }
+         else
+ #endif // OCIO_GPU_ENABLED
+         {
+-            const OCIO::BitDepth bitDepth = OCIO::GetBitDepth(spec);
++            /*
++                Set the bit-depth of the output buffer.
++
++                Whereas the GPU processor always work on float data, the CPU processor
++                can be optimised for a specific input and output bit-depth.
++
++                The converted image may require more bits than the source image.
++                For example, converting a log image to linear requires at least a half-float
++                output format. For most cases, half-float strikes a good balance between
++                precision and storage space. But if the input depth would lose precision
++                when converted to half-float, use float for the output depth instead.
++
++                Note that when using OpenImageIO, the actual output bit-depth may be overrided
++                if the file format doesn't support it. OCIO is not trying to analyze the filename
++                to emulate OpenImageIO's decision making process.
++            */
++            const OCIO::BitDepth inputBitDepth = imgInput.getBitDepth();
++            OCIO::BitDepth outputBitDepth;
+ 
+-            OCIO::ConstCPUProcessorRcPtr cpuProcessor 
+-                = processor->getOptimizedCPUProcessor(bitDepth, bitDepth,
++            if (inputBitDepth == OCIO::BIT_DEPTH_UINT16 || inputBitDepth == OCIO::BIT_DEPTH_F32)
++            {
++                outputBitDepth = OCIO::BIT_DEPTH_F32;
++            }
++            else if (inputBitDepth == OCIO::BIT_DEPTH_UINT8 || inputBitDepth == OCIO::BIT_DEPTH_F16)
++            {
++                outputBitDepth = OCIO::BIT_DEPTH_F16;
++            }
++            else
++            {
++                throw OCIO::Exception("Unsupported input bitdepth, must be uint8, uint16, half or float.");
++            }
++
++            OCIO::ConstCPUProcessorRcPtr cpuProcessor
++                = processor->getOptimizedCPUProcessor(inputBitDepth,
++                                                      outputBitDepth,
+                                                       OCIO::OPTIMIZATION_DEFAULT);
+ 
++            const bool useOutputBuffer = inputBitDepth != outputBitDepth;
++
++            if (useOutputBuffer)
++            {
++                imgOutputCPU.init(imgInput, outputBitDepth);
++                imgOutput = &imgOutputCPU;
++            }
++
+             const std::chrono::high_resolution_clock::time_point start
+                 = std::chrono::high_resolution_clock::now();
+ 
+-            OCIO::ImageDescRcPtr imgDesc = OCIO::CreateImageDesc(spec, img);
+-            cpuProcessor->apply(*imgDesc);
++            if (useOutputBuffer)
++            {
++                OCIO::ImageDescRcPtr srcImgDesc = imgInput.getImageDesc();
++                OCIO::ImageDescRcPtr dstImgDesc = imgOutputCPU.getImageDesc();
++                cpuProcessor->apply(*srcImgDesc, *dstImgDesc);
++            }
++            else
++            {
++                OCIO::ImageDescRcPtr imgDesc = imgInput.getImageDesc();
++                cpuProcessor->apply(*imgDesc);
++            }
+ 
+-            if(verbose)
++            if (verbose)
+             {
+                 const std::chrono::high_resolution_clock::time_point end
+                     = std::chrono::high_resolution_clock::now();
+@@ -544,69 +453,67 @@
+             }
+         }
+     }
+-    catch(OCIO::Exception & exception)
++    catch (const OCIO::Exception & exception)
+     {
+         std::cerr << "ERROR: OCIO failed with: " << exception.what() << std::endl;
+         exit(1);
+     }
+-    catch(...)
++    catch (...)
+     {
+         std::cerr << "ERROR: Unknown error processing the image." << std::endl;
+         exit(1);
+     }
+ 
+-    //
+-    // set the provided OpenImageIO attributes.
+-    //
+-    bool parseerror = false;
+-    for(unsigned int i=0; i<floatAttrs.size(); ++i)
++    // Set the provided image attributes.
++    bool parseError = false;
++    for (unsigned int i=0; i<floatAttrs.size(); ++i)
+     {
+         std::string name, value;
+         float fval = 0.0f;
+ 
+-        if(!ParseNameValuePair(name, value, floatAttrs[i]) ||
++        if (!ParseNameValuePair(name, value, floatAttrs[i]) ||
+            !StringToFloat(&fval,value.c_str()))
+         {
+             std::cerr << "ERROR: Attribute string '" << floatAttrs[i]
+                       << "' should be in the form name=floatvalue." << std::endl;
+-            parseerror = true;
++            parseError = true;
+             continue;
+         }
+ 
+-        spec.attribute(name, fval);
++        imgOutput->attribute(name, fval);
+     }
+ 
+-    for(unsigned int i=0; i<intAttrs.size(); ++i)
++    for (unsigned int i=0; i<intAttrs.size(); ++i)
+     {
+         std::string name, value;
+         int ival = 0;
+-        if(!ParseNameValuePair(name, value, intAttrs[i]) ||
++        if (!ParseNameValuePair(name, value, intAttrs[i]) ||
+            !StringToInt(&ival,value.c_str()))
+         {
+             std::cerr << "ERROR: Attribute string '" << intAttrs[i]
+                       << "' should be in the form name=intvalue." << std::endl;
+-            parseerror = true;
++            parseError = true;
+             continue;
+         }
+ 
+-        spec.attribute(name, ival);
++        imgOutput->attribute(name, ival);
+     }
+ 
+-    for(unsigned int i=0; i<stringAttrs.size(); ++i)
++    for (unsigned int i=0; i<stringAttrs.size(); ++i)
+     {
+         std::string name, value;
+-        if(!ParseNameValuePair(name, value, stringAttrs[i]))
++        if (!ParseNameValuePair(name, value, stringAttrs[i]))
+         {
+             std::cerr << "ERROR: Attribute string '" << stringAttrs[i]
+                       << "' should be in the form name=value." << std::endl;
+-            parseerror = true;
++            parseError = true;
+             continue;
+         }
+ 
+-        spec.attribute(name, value);
++        imgOutput->attribute(name, value);
+     }
+ 
+-    if(parseerror)
++    if (parseError)
+     {
+         exit(1);
+     }
+@@ -614,17 +521,6 @@
+     // Write out the result.
+     try
+     {
+-#if OIIO_VERSION < 10903
+-        OIIO::ImageOutput* f = OIIO::ImageOutput::create(outputimage);
+-#else
+-        auto f = OIIO::ImageOutput::create(outputimage);
+-#endif
+-        if(!f)
+-        {
+-            std::cerr << "ERROR: Could not create output input." << std::endl;
+-            exit(1);
+-        }
+-
+         if (useDisplayView)
+         {
+             OCIO::ConstConfigRcPtr config = OCIO::GetCurrentConfig();
+@@ -633,31 +529,19 @@
+ 
+         if (outputcolorspace)
+         {
+-            spec.attribute("oiio:ColorSpace", outputcolorspace);
++            imgOutput->attribute("oiio:ColorSpace", outputcolorspace);
+         }
+ 
+-        f->open(outputimage, spec);
+-
+-        if(!f->write_image(spec.format, img.getBuffer()))
+-        {
+-            std::cerr << "ERROR: Writing \"" << outputimage << "\" failed with: "
+-                      << f->geterror() << "." << std::endl;
+-            exit(1);
+-        }
+-
+-        f->close();
+-#if OIIO_VERSION < 10903
+-        OIIO::ImageOutput::destroy(f);
+-#endif
++        imgOutput->write(outputimage);
+     }
+-    catch(...)
++    catch (...)
+     {
+         std::cerr << "ERROR: Writing file \"" << outputimage << "\"." << std::endl;
+         exit(1);
+     }
+ 
+-    std::cout << std::endl;
+     std::cout << "Wrote " << outputimage << std::endl;
++    std::cout << imgOutput->getImageDescStr() << std::endl;
+ 
+     return 0;
+ }
+@@ -672,7 +556,10 @@
+ {
+     // split string into name=value.
+     size_t pos = input.find('=');
+-    if(pos==std::string::npos) return false;
++    if (pos==std::string::npos)
++    {
++        return false;
++    }
+ 
+     name = input.substr(0,pos);
+     value = input.substr(pos+1);
+@@ -682,49 +569,42 @@
+ // return true on success.
+ bool StringToFloat(float * fval, const char * str)
+ {
+-    if(!str) return false;
++    if (!str)
++    {
++        return false;
++    }
+ 
+     std::istringstream inputStringstream(str);
+     float x;
+-    if(!(inputStringstream >> x))
++    if (!(inputStringstream >> x))
+     {
+         return false;
+     }
+ 
+-    if(fval) *fval = x;
++    if (fval)
++    {
++        *fval = x;
++    }
+     return true;
+ }
+ 
+ bool StringToInt(int * ival, const char * str)
+ {
+-    if(!str) return false;
++    if (!str)
++    {
++        return false;
++    }
+ 
+     std::istringstream inputStringstream(str);
+     int x;
+-    if(!(inputStringstream >> x))
++    if (!(inputStringstream >> x))
+     {
+         return false;
+     }
+ 
+-    if(ival) *ival = x;
+-    return true;
+-}
+-
+-bool StringToVector(std::vector<int> * ivector, const char * str)
+-{
+-    std::stringstream ss(str);
+-    int i;
+-    while (ss >> i)
++    if (ival)
+     {
+-        ivector->push_back(i);
+-        if (ss.peek() == ',')
+-        {
+-          ss.ignore();
+-        }
++        *ival = x;
+     }
+-    return ivector->size() != 0;
++    return true;
+ }
+-
+-
+-
+-
+--- a/src/apps/ociodisplay/CMakeLists.txt
++++ b/src/apps/ociodisplay/CMakeLists.txt
+@@ -6,19 +6,10 @@
+     return()
+ endif()
+ 
+-set(SOURCES
+-    main.cpp
+-)
++set(SOURCES main.cpp)
+ 
+ add_executable(ociodisplay ${SOURCES})
+ 
+-if(NOT BUILD_SHARED_LIBS)
+-    target_compile_definitions(ociodisplay
+-        PRIVATE
+-            OpenColorIO_SKIP_IMPORTS
+-    )
+-endif()
+-
+ set(CUSTOM_COMPILE_FLAGS ${PLATFORM_COMPILE_FLAGS})
+ if(APPLE)
+     # Mute the deprecated warning for some GLUT methods.
+@@ -26,24 +17,35 @@
+ endif()
+ 
+ set_target_properties(ociodisplay PROPERTIES 
+-	COMPILE_FLAGS "${CUSTOM_COMPILE_FLAGS}")
++    COMPILE_FLAGS "${CUSTOM_COMPILE_FLAGS}"
++)
++
++if (USE_MSVC)
++	# Temporary until fixed in OpenImageIO: Mute some warnings from OpenImageIO farmhash.h
++	# C4267 (level 3)	    'var' : conversion from 'size_t' to 'type', possible loss of data
++	# C4244	(level 3 & 4)	'conversion' conversion from 'type1' to 'type2', possible loss of data
++	target_compile_options(ociodisplay PRIVATE /wd4267 /wd4244)
++endif()
+ 
+ target_include_directories(ociodisplay 
+-	SYSTEM
+-	PRIVATE
+-		${GLEW_INCLUDE_DIRS}
+-		${GLUT_INCLUDE_DIR}
+-		${OPENGL_INCLUDE_DIR}
++    SYSTEM
++    PRIVATE
++        ${GLEW_INCLUDE_DIRS}
++        ${GLUT_INCLUDE_DIR}
++        ${OPENGL_INCLUDE_DIR}
+ )
++
+ target_link_libraries(ociodisplay
+-	PRIVATE 
+-		${GLEW_LIBRARIES}
+-		${GLUT_LIBRARIES}
+-		oglapphelpers
+-		OpenColorIO
+-		${OPENGL_LIBRARIES}
+-		OpenImageIO::OpenImageIO
++    PRIVATE
++        ${GLEW_LIBRARIES}
++        ${GLUT_LIBRARIES}
++        ${OPENGL_LIBRARIES}
++        apputils
++        imageioapphelpers
++        oglapphelpers
++        OpenColorIO
+ )
++
+ install(TARGETS ociodisplay
+     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+ )
+--- a/src/apps/ociodisplay/main.cpp
++++ b/src/apps/ociodisplay/main.cpp
+@@ -9,6 +9,7 @@
+ #include <cstring>
+ #include <iostream>
+ #include <fstream>
++#include <map>
+ #include <sstream>
+ #include <utility>
+ #include <vector>
+@@ -16,9 +17,6 @@
+ #include <OpenColorIO/OpenColorIO.h>
+ namespace OCIO = OCIO_NAMESPACE;
+ 
+-#include <OpenImageIO/imageio.h>
+-#include <OpenImageIO/typedesc.h>
+-
+ #ifdef __APPLE__
+ #include <OpenGL/gl.h>
+ #include <OpenGL/glext.h>
+@@ -34,8 +32,10 @@
+ #if __APPLE__
+ #include "metalapp.h"
+ #endif
++
+ #include "glsl.h"
+ #include "oglapp.h"
++#include "imageio.h"
+ 
+ bool g_verbose   = false;
+ bool g_gpulegacy = false;
+@@ -46,7 +46,6 @@
+ 
+ std::string g_filename;
+ 
+-
+ float g_imageAspect;
+ 
+ std::string g_inputColorSpace;
+@@ -73,58 +72,24 @@
+ 
+ static void InitImageTexture(const char * filename)
+ {
+-    std::vector<float> img;
+-    int texWidth = 512;
+-    int texHeight = 512;
+-    int components = 4;
++    OCIO::ImageIO img;
+ 
+-    if(filename && *filename)
++    if (filename && *filename)
+     {
+-        std::cout << "loading: " << filename << std::endl;
++        std::cout << "Loading: " << filename << std::endl;
++
+         try
+         {
+-#if OIIO_VERSION < 10903
+-            OIIO::ImageInput* f = OIIO::ImageInput::create(filename);
+-#else
+-            auto f = OIIO::ImageInput::create(filename);
+-#endif
+-            if(!f)
+-            {
+-                std::cerr << "Could not create image input." << std::endl;
+-                exit(1);
+-            }
+-
+-            OIIO::ImageSpec spec;
+-            f->open(filename, spec);
+-
+-            std::string error = f->geterror();
+-            if(!error.empty())
+-            {
+-                std::cerr << "Error loading image " << error << std::endl;
+-                exit(1);
+-            }
+-
+-            texWidth = spec.width;
+-            texHeight = spec.height;
+-            components = spec.nchannels;
+-
+-            img.resize(texWidth*texHeight*components);
+-            memset(&img[0], 0, texWidth*texHeight*components*sizeof(float));
+-
+-            const bool ok = f->read_image(OIIO::TypeDesc::FLOAT, &img[0]);
+-            if(!ok)
+-            {
+-                std::cerr << "Error reading \"" << filename << "\" : " << f->geterror() << "\n";
+-                exit(1);
+-            }
+-
+-#if OIIO_VERSION < 10903
+-            OIIO::ImageInput::destroy(f);
+-#endif
++            img.read(filename, OCIO::BIT_DEPTH_F32);
+         }
+-        catch(...)
++        catch (const std::exception & e)
+         {
+-            std::cerr << "Error loading file.";
++            std::cerr << "ERROR: Loading file failed: " << e.what() << std::endl;
++            exit(1);
++        }
++        catch (...)
++        {
++            std::cerr << "ERROR: Loading file failed." << std::endl;
+             exit(1);
+         }
+     }
+@@ -133,46 +98,53 @@
+     {
+         std::cout << "No image specified, loading gradient." << std::endl;
+ 
+-        img.resize(texWidth*texHeight*components);
+-        memset(&img[0], 0, texWidth*texHeight*components*sizeof(float));
++        img.init(512, 512, OCIO::CHANNEL_ORDERING_RGBA, OCIO::BIT_DEPTH_F32);
++
++        float * pixels = (float *) img.getData();
++        const long width = img.getWidth();
++        const long channels = img.getNumChannels();
+ 
+-        for(int y=0; y<texHeight; ++y)
++        for (int y=0; y<img.getHeight(); ++y)
+         {
+-            for(int x=0; x<texWidth; ++x)
++            for (int x=0; x<img.getWidth(); ++x)
+             {
+-                float c = (float)x/((float)texWidth-1.0f);
+-                img[components*(texWidth*y+x) + 0] = c;
+-                img[components*(texWidth*y+x) + 1] = c;
+-                img[components*(texWidth*y+x) + 2] = c;
+-                img[components*(texWidth*y+x) + 3] = 1.0f;
++                float c = (float)x / ((float)width-1.0f);
++                pixels[channels*(width*y+x) + 0] = c;
++                pixels[channels*(width*y+x) + 1] = c;
++                pixels[channels*(width*y+x) + 2] = c;
++                pixels[channels*(width*y+x) + 3] = 1.0f;
+             }
+         }
+     }
+ 
+     OCIO::OglApp::Components comp = OCIO::OglApp::COMPONENTS_RGBA;
+-    if (components == 4)
++    if (img.getNumChannels() == 4)
+     {
+         comp = OCIO::OglApp::COMPONENTS_RGBA;
+     }
+-    else if (components == 3)
++    else if (img.getNumChannels() == 3)
+     {
+         comp = OCIO::OglApp::COMPONENTS_RGB;
+     }
+     else
+     {
+-        std::cerr << "Cannot load image with " << components << " components." << std::endl;
++        std::cerr << "Cannot load image with " << img.getNumChannels()
++                  << " components." << std::endl;
+         exit(1);
+     }
+ 
+     g_imageAspect = 1.0;
+-    if(texHeight!=0)
++    if (img.getHeight()!=0)
+     {
+-        g_imageAspect = (float) texWidth / (float) texHeight;
++        g_imageAspect = (float) img.getWidth() / (float) img.getHeight();
+     }
+ 
+     if (g_oglApp)
+     {
+-        g_oglApp->initImage(texWidth, texHeight, comp, &img[0]);
++        g_oglApp->initImage(img.getWidth(),
++                            img.getHeight(),
++                            comp,
++                            (float*) img.getData());
+     }
+ 
+ }
+@@ -183,12 +155,12 @@
+     g_display = config->getDefaultDisplay();
+     g_transformName = config->getDefaultView(g_display.c_str());
+     g_look = config->getDisplayViewLooks(g_display.c_str(), g_transformName.c_str());
+-
+     g_inputColorSpace = OCIO::ROLE_SCENE_LINEAR;
+-    if(filename && *filename)
++
++    if (filename && *filename)
+     {
+         std::string cs = config->getColorSpaceFromFilepath(filename);
+-        if(!cs.empty())
++        if (!cs.empty())
+         {
+             g_inputColorSpace = cs;
+             std::cout << "colorspace: " << cs << std::endl;
+@@ -223,52 +195,51 @@
+     g_oglApp.reset();
+ }
+ 
+-
+ static void Key(unsigned char key, int /*x*/, int /*y*/)
+ {
+-    if(key == 'c' || key == 'C')
++    if (key == 'c' || key == 'C')
+     {
+         g_channelHot[0] = 1;
+         g_channelHot[1] = 1;
+         g_channelHot[2] = 1;
+         g_channelHot[3] = 1;
+     }
+-    else if(key == 'r' || key == 'R')
++    else if (key == 'r' || key == 'R')
+     {
+         g_channelHot[0] = 1;
+         g_channelHot[1] = 0;
+         g_channelHot[2] = 0;
+         g_channelHot[3] = 0;
+     }
+-    else if(key == 'g' || key == 'G')
++    else if (key == 'g' || key == 'G')
+     {
+         g_channelHot[0] = 0;
+         g_channelHot[1] = 1;
+         g_channelHot[2] = 0;
+         g_channelHot[3] = 0;
+     }
+-    else if(key == 'b' || key == 'B')
++    else if (key == 'b' || key == 'B')
+     {
+         g_channelHot[0] = 0;
+         g_channelHot[1] = 0;
+         g_channelHot[2] = 1;
+         g_channelHot[3] = 0;
+     }
+-    else if(key == 'a' || key == 'A')
++    else if (key == 'a' || key == 'A')
+     {
+         g_channelHot[0] = 0;
+         g_channelHot[1] = 0;
+         g_channelHot[2] = 0;
+         g_channelHot[3] = 1;
+     }
+-    else if(key == 'l' || key == 'L')
++    else if (key == 'l' || key == 'L')
+     {
+         g_channelHot[0] = 1;
+         g_channelHot[1] = 1;
+         g_channelHot[2] = 1;
+         g_channelHot[3] = 0;
+     }
+-    else if(key == 27)
++    else if (key == 27)
+     {
+         CleanUp();
+         exit(0);
+@@ -278,7 +249,6 @@
+     glutPostRedisplay();
+ }
+ 
+-
+ static void SpecialKey(int key, int x, int y)
+ {
+     (void) x;
+@@ -339,7 +309,7 @@
+     vp->setLooksOverrideEnabled(true);
+     vp->setLooksOverride(g_look.c_str());
+ 
+-    if(g_verbose)
++    if (g_verbose)
+     {
+         std::cout << std::endl;
+         std::cout << "Color transformation composed of:" << std::endl;
+@@ -407,12 +377,12 @@
+     {
+         processor = vp->getProcessor(config, config->getCurrentContext());
+     }
+-    catch(OCIO::Exception & e)
++    catch (const OCIO::Exception & e)
+     {
+         std::cerr << e.what() << std::endl;
+         return;
+     }
+-    catch(...)
++    catch (...)
+     {
+         return;
+     }
+@@ -446,7 +416,10 @@
+ {
+     OCIO::ConstConfigRcPtr config = OCIO::GetCurrentConfig();
+     const char * name = config->getColorSpaceNameByIndex(id);
+-    if(!name) return;
++    if (!name)
++    {
++        return;
++    }
+ 
+     g_inputColorSpace = name;
+ 
+@@ -458,7 +431,10 @@
+ {
+     OCIO::ConstConfigRcPtr config = OCIO::GetCurrentConfig();
+     const char * display = config->getDisplay(id);
+-    if(!display) return;
++    if (!display)
++    {
++        return;
++    }
+ 
+     g_display = display;
+ 
+@@ -479,7 +455,10 @@
+     OCIO::ConstConfigRcPtr config = OCIO::GetCurrentConfig();
+ 
+     const char * transform = config->getView(g_display.c_str(), id);
+-    if(!transform) return;
++    if (!transform)
++    {
++        return;
++    }
+ 
+     g_transformName = transform;
+ 
+@@ -494,7 +473,10 @@
+     OCIO::ConstConfigRcPtr config = OCIO::GetCurrentConfig();
+ 
+     const char * look = config->getLookNameByIndex(id);
+-    if(!look || !*look) return;
++    if (!look || !*look)
++    {
++        return;
++    }
+ 
+     g_look = look;
+ 
+@@ -517,18 +499,18 @@
+     int csMenuID = glutCreateMenu(imageColorSpace_CB);
+ 
+     std::map<std::string, int> families;
+-    for(int i=0; i<config->getNumColorSpaces(); ++i)
++    for (int i=0; i<config->getNumColorSpaces(); ++i)
+     {
+         const char * csName = config->getColorSpaceNameByIndex(i);
+-        if(csName && *csName)
++        if (csName && *csName)
+         {
+             OCIO::ConstColorSpaceRcPtr cs = config->getColorSpace(csName);
+-            if(cs)
++            if (cs)
+             {
+                 const char * family = cs->getFamily();
+-                if(family && *family)
++                if (family && *family)
+                 {
+-                    if(families.find(family)==families.end())
++                    if (families.find(family)==families.end())
+                     {
+                         families[family] = glutCreateMenu(imageColorSpace_CB);
+                         glutAddMenuEntry(csName, i);
+@@ -552,20 +534,20 @@
+     }
+ 
+     int deviceMenuID = glutCreateMenu(displayDevice_CB);
+-    for(int i=0; i<config->getNumDisplays(); ++i)
++    for (int i=0; i<config->getNumDisplays(); ++i)
+     {
+         glutAddMenuEntry(config->getDisplay(i), i);
+     }
+ 
+     int transformMenuID = glutCreateMenu(transform_CB);
+     const char * defaultDisplay = config->getDefaultDisplay();
+-    for(int i=0; i<config->getNumViews(defaultDisplay); ++i)
++    for (int i=0; i<config->getNumViews(defaultDisplay); ++i)
+     {
+         glutAddMenuEntry(config->getView(defaultDisplay, i), i);
+     }
+ 
+     int lookMenuID = glutCreateMenu(look_CB);
+-    for(int i=0; i<config->getNumLooks(); ++i)
++    for (int i=0; i<config->getNumLooks(); ++i)
+     {
+         glutAddMenuEntry(config->getLookNameByIndex(i), i);
+     }
+@@ -609,27 +591,27 @@
+ 
+ void parseArguments(int argc, char **argv)
+ {
+-    for(int i=1; i<argc; ++i)
++    for (int i=1; i<argc; ++i)
+     {
+-        if(0==strcmp(argv[i], "-v"))
++        if (0==strcmp(argv[i], "-v"))
+         {
+             g_verbose = true;
+         }
+-        else if(0==strcmp(argv[i], "-gpulegacy"))
++        else if (0==strcmp(argv[i], "-gpulegacy"))
+         {
+             g_gpulegacy = true;
+         }
+-        else if(0==strcmp(argv[i], "-gpuinfo"))
++        else if (0==strcmp(argv[i], "-gpuinfo"))
+         {
+             g_gpuinfo = true;
+         }
+ #if __APPLE__
+-        else if(0==strcmp(argv[i], "-metal"))
++        else if (0==strcmp(argv[i], "-metal"))
+         {
+             g_useMetal = true;
+         }
+ #endif
+-        else if(0==strcmp(argv[i], "-h"))
++        else if (0==strcmp(argv[i], "-h"))
+         {
+             std::cout << std::endl;
+             std::cout << "help:" << std::endl;
+@@ -660,7 +642,7 @@
+     try
+     {
+ #if __APPLE__
+-        if(g_useMetal)
++        if (g_useMetal)
+         {
+             g_oglApp = std::make_shared<OCIO::MetalApp>("ociodisplay", 512, 512);
+         }
+@@ -689,15 +671,15 @@
+     glutSpecialFunc(SpecialKey);
+     glutDisplayFunc(Redisplay);
+ 
+-    if(g_verbose)
++    if (g_verbose)
+     {
+-        if(!g_filename.empty())
++        if (!g_filename.empty())
+         {
+             std::cout << std::endl;
+             std::cout << "Image: " << g_filename << std::endl;
+         }
+         std::cout << std::endl;
+-        std::cout << "OIIO Version: " << OIIO_VERSION_STRING << std::endl;
++        std::cout << OCIO::ImageIO::GetVersion() << std::endl;
+         std::cout << "OCIO Version: " << OCIO::GetVersion() << std::endl;
+     }
+ 
+@@ -706,18 +688,18 @@
+     {
+         config = OCIO::GetCurrentConfig();
+     }
+-    catch(...)
++    catch (...)
+     {
+         const char * env = OCIO::GetEnvVariable("OCIO");
+         std::cerr << "Error loading the config file: '" << (env ? env : "") << "'";
+         exit(1);
+     }
+ 
+-    if(g_verbose)
++    if (g_verbose)
+     {
+         const char * env = OCIO::GetEnvVariable("OCIO");
+ 
+-        if(env && *env)
++        if (env && *env)
+         {
+             std::cout << std::endl;
+             std::cout << "OCIO Config. file   : '" << env << "'" << std::endl;
+@@ -747,7 +729,7 @@
+     {
+         UpdateOCIOGLState();
+     }
+-    catch(OCIO::Exception & e)
++    catch (const OCIO::Exception & e)
+     {
+         std::cerr << e.what() << std::endl;
+         exit(1);
+--- a/src/apps/ociolutimage/CMakeLists.txt
++++ b/src/apps/ociolutimage/CMakeLists.txt
+@@ -7,21 +7,21 @@
+ 
+ add_executable(ociolutimage ${SOURCES})
+ 
+-if(NOT BUILD_SHARED_LIBS)
+-	target_compile_definitions(ociolutimage
+-		PRIVATE
+-			OpenColorIO_SKIP_IMPORTS
+-	)
+-endif()
+-
+ set_target_properties(ociolutimage PROPERTIES
+ 	COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS}")
+ 
++if (USE_MSVC)
++	# Temporary until fixed in OpenImageIO: Mute some warnings from OpenImageIO farmhash.h
++	# C4267 (level 3)	    'var' : conversion from 'size_t' to 'type', possible loss of data
++	# C4244	(level 3 & 4)	'conversion' conversion from 'type1' to 'type2', possible loss of data
++	target_compile_options(ociolutimage PRIVATE /wd4267 /wd4244)
++endif()
++
+ target_link_libraries(ociolutimage
+ 	PRIVATE
+ 		apputils
++		imageioapphelpers
+ 		OpenColorIO
+-		OpenImageIO::OpenImageIO
+ 		utils::strings
+ )
+ 
+--- a/src/apps/ociolutimage/main.cpp
++++ b/src/apps/ociolutimage/main.cpp
+@@ -1,23 +1,21 @@
+ // SPDX-License-Identifier: BSD-3-Clause
+ // Copyright Contributors to the OpenColorIO Project.
+ 
+-#include <OpenColorIO/OpenColorIO.h>
+-namespace OCIO = OCIO_NAMESPACE;
+-
+-
+-#include <OpenImageIO/imageio.h>
+-#include <OpenImageIO/typedesc.h>
+-
+-#include "apputils/argparse.h"
+-
+ #include <algorithm>
+ #include <cmath>
+ #include <fstream>
++#include <iostream>
+ #include <string>
+ #include <sstream>
+ 
++#include <OpenColorIO/OpenColorIO.h>
++namespace OCIO = OCIO_NAMESPACE;
++
++#include "apputils/argparse.h"
+ #include "utils/StringUtils.h"
+ 
++#include "imageio.h"
++
+ enum Lut3DOrder
+ {
+     LUT3DORDER_FAST_RED = 0,
+@@ -33,7 +31,7 @@
+ {
+     // Compute the image width / height
+     width = cubesize*cubesize;
+-    if(maxwidth>0 && width>=maxwidth)
++    if (maxwidth>0 && width>=maxwidth)
+     {
+         // TODO: Do something smarter here to find a better multiple,
+         // to create a more pleasing gradient rendition.
+@@ -57,19 +55,23 @@
+     int numchannels = 3;
+     GetLutImageSize(width, height, cubesize, maxwidth);
+ 
+-    std::vector<float> img;
+-    img.resize(width*height*numchannels, 0);
++    OCIO::ImageIO img(width,
++                      height,
++                      OCIO::CHANNEL_ORDERING_RGB,
++                      OCIO::BIT_DEPTH_F32);
++
++    float * pixels = (float*) img.getData();
+ 
+-    GenerateIdentityLut3D(&img[0], cubesize, numchannels, LUT3DORDER_FAST_RED);
++    GenerateIdentityLut3D(pixels, cubesize, numchannels, LUT3DORDER_FAST_RED);
+ 
+-    if(!incolorspace.empty() || !outcolorspace.empty())
++    if (!incolorspace.empty() || !outcolorspace.empty())
+     {
+         OCIO::ConstConfigRcPtr config = OCIO::Config::Create();
+-        if(!configfile.empty())
++        if (!configfile.empty())
+         {
+             config = OCIO::Config::CreateFromFile(configfile.c_str());
+         }
+-        else if(OCIO::GetEnvVariable("OCIO"))
++        else if (OCIO::GetEnvVariable("OCIO"))
+         {
+             config = OCIO::Config::CreateFromEnv();
+         }
+@@ -83,38 +85,14 @@
+ 
+         OCIO::ConstCPUProcessorRcPtr processor =
+             config->getProcessor(incolorspace.c_str(),
+-                                 outcolorspace.c_str())->getDefaultCPUProcessor();
++                                 outcolorspace.c_str()
++                                )->getDefaultCPUProcessor();
+ 
+-        OCIO::PackedImageDesc imgdesc(&img[0], width, height, 3);
+-        processor->apply(imgdesc);
+-    }
+-
+-#if OIIO_VERSION < 10903
+-    OIIO::ImageOutput* f = OIIO::ImageOutput::create(outputfile);
+-#else
+-    auto f = OIIO::ImageOutput::create(outputfile);
+-#endif
+-    if(!f)
+-    {
+-        throw OCIO::Exception( "Could not create output image.");
++        processor->apply(*img.getImageDesc());
+     }
+ 
+-    OIIO::ImageSpec spec(width, height, numchannels, OIIO::TypeDesc::TypeFloat);
+-
+     // TODO: If DPX, force 16-bit output?
+-    f->open(outputfile, spec);
+-    const bool ok = f->write_image(OIIO::TypeDesc::FLOAT, &img[0]);
+-    if(!ok)
+-    {
+-        std::stringstream ss;
+-        ss << "Error writing \"" << outputfile << "\" : " << f->geterror() << "\n";
+-        throw OCIO::Exception(ss.str().c_str());
+-    }
+-
+-    f->close();
+-#if OIIO_VERSION < 10903
+-    OIIO::ImageOutput::destroy(f);
+-#endif
++    img.write(outputfile);
+ }
+ 
+ 
+@@ -122,92 +100,39 @@
+              const std::string & inputfile,
+              const std::string & outputfile)
+ {
+-    // Read the image
+-#if OIIO_VERSION < 10903
+-    OIIO::ImageInput* f = OIIO::ImageInput::create(inputfile);
+-#else
+-    auto f = OIIO::ImageInput::create(inputfile);
+-#endif
+-    if(!f)
+-    {
+-        throw OCIO::Exception("Could not create input image.");
+-    }
+-
+-    OIIO::ImageSpec spec;
+-    f->open(inputfile, spec);
+-
+-    std::string error = f->geterror();
+-    if(!error.empty())
+-    {
+-        std::ostringstream os;
+-        os << "Error loading image " << error;
+-        throw OCIO::Exception(os.str().c_str());
+-    }
++    OCIO::ImageIO img(inputfile);
+ 
+     int width = 0;
+     int height = 0;
+     GetLutImageSize(width, height, cubesize, maxwidth);
+ 
+-    if(spec.width != width || spec.height != height)
++    if (img.getWidth() != width || img.getHeight() != height)
+     {
+         std::ostringstream os;
+         os << "Image does not have expected dimensions. ";
+         os << "Expected " << width << "x" << height << ", ";
+-        os << "Found " << spec.width << "x" << spec.height;
++        os << "Found " << img.getWidth() << "x" << img.getHeight();
+         throw OCIO::Exception(os.str().c_str());
+     }
+ 
+-    if(spec.nchannels<3)
++    if (img.getNumChannels() != 3)
+     {
+-        throw OCIO::Exception("Image must have 3 or more channels.");
++        throw OCIO::Exception("Image must have 3 channels.");
+     }
+ 
+     int lut3DNumPixels = cubesize*cubesize*cubesize;
+ 
+-    if(spec.width*spec.height<lut3DNumPixels)
++    if (img.getWidth() * img.getHeight() < lut3DNumPixels)
+     {
+         throw OCIO::Exception("Image is not large enough to contain expected 3D LUT.");
+     }
+ 
+-    // TODO: confirm no data window?
+-    std::vector<float> img;
+-    img.resize(spec.width*spec.height*spec.nchannels, 0);
+-    const bool ok = f->read_image(OIIO::TypeDesc::FLOAT, &img[0]);
+-    if(!ok)
+-    {
+-        std::stringstream ss;
+-        ss << "Error reading \"" << inputfile << "\" : " << f->geterror() << "\n";
+-        throw OCIO::Exception(ss.str().c_str());
+-    }
+-
+-#if OIIO_VERSION < 10903
+-    OIIO::ImageInput::destroy(f);
+-#endif
+-
+-    // Repack into rgb
+-    // Convert the RGB[...] image to an RGB image, in place.
+-    // Of course, this only works because we're doing it from left to right
+-    // so old pixels are read before they're written over
+-
+-    if(spec.nchannels > 3)
+-    {
+-        for(int i=0; i<lut3DNumPixels; ++i)
+-        {
+-            img[3*i+0] = img[spec.nchannels*i+0];
+-            img[3*i+1] = img[spec.nchannels*i+1];
+-            img[3*i+2] = img[spec.nchannels*i+2];
+-        }
+-    }
+-
+-    img.resize(lut3DNumPixels*3);
+-
+-    // Write the output LUT
+-    WriteLut3D(outputfile, &img[0], cubesize);
++    WriteLut3D(outputfile, (float*) img.getData(), cubesize);
+ }
+ 
+ 
+ 
+-int main (int argc, const char* argv[])
++int main(int argc, const char* argv[])
+ {
+     bool generate = false;
+     bool extract = false;
+@@ -253,38 +178,43 @@
+         return 1;
+     }
+ 
+-    if(generate)
++    if (generate)
+     {
+         try
+         {
+-            Generate(cubesize, maxwidth,
++            Generate(cubesize,
++                     maxwidth,
+                      outputfile,
+-                     config, incolorspace, outcolorspace);
++                     config,
++                     incolorspace,
++                     outcolorspace);
+         }
+-        catch(std::exception & e)
++        catch (const std::exception & e)
+         {
+             std::cerr << "Error generating image: " << e.what() << std::endl;
+             exit(1);
+         }
+-        catch(...)
++        catch (...)
+         {
+             std::cerr << "Error generating image. An unknown error occurred.\n";
+             exit(1);
+         }
+     }
+-    else if(extract)
++    else if (extract)
+     {
+         try
+         {
+-            Extract(cubesize, maxwidth,
+-                    inputfile, outputfile);
++            Extract(cubesize,
++                    maxwidth,
++                    inputfile,
++                    outputfile);
+         }
+-        catch(std::exception & e)
++        catch (const std::exception & e)
+         {
+             std::cerr << "Error extracting LUT: " << e.what() << std::endl;
+             exit(1);
+         }
+-        catch(...)
++        catch (...)
+         {
+             std::cerr << "Error extracting LUT. An unknown error occurred.\n";
+             exit(1);
+@@ -313,26 +243,30 @@
+ void GenerateIdentityLut3D(float* img, int edgeLen, int numChannels,
+                            Lut3DOrder lut3DOrder)
+ {
+-    if(!img) return;
+-    if(numChannels < 3)
++    if (!img)
++    {
++        return;
++    }
++
++    if (numChannels < 3)
+     {
+         throw OCIO::Exception("Cannot generate identity 3D LUT with less than 3 channels.");
+     }
+ 
+     float c = 1.0f / ((float)edgeLen - 1.0f);
+ 
+-    if(lut3DOrder == LUT3DORDER_FAST_RED)
++    if (lut3DOrder == LUT3DORDER_FAST_RED)
+     {
+-        for(int i=0; i<edgeLen*edgeLen*edgeLen; i++)
++        for (int i=0; i<edgeLen*edgeLen*edgeLen; i++)
+         {
+             img[numChannels*i+0] = (float)(i%edgeLen) * c;
+             img[numChannels*i+1] = (float)((i/edgeLen)%edgeLen) * c;
+             img[numChannels*i+2] = (float)((i/edgeLen/edgeLen)%edgeLen) * c;
+         }
+     }
+-    else if(lut3DOrder == LUT3DORDER_FAST_BLUE)
++    else if (lut3DOrder == LUT3DORDER_FAST_BLUE)
+     {
+-        for(int i=0; i<edgeLen*edgeLen*edgeLen; i++)
++        for (int i=0; i<edgeLen*edgeLen*edgeLen; i++)
+         {
+             img[numChannels*i+0] = (float)((i/edgeLen/edgeLen)%edgeLen) * c;
+             img[numChannels*i+1] = (float)((i/edgeLen)%edgeLen) * c;
+@@ -347,7 +281,7 @@
+ 
+ void WriteLut3D(const std::string & filename, const float* lutdata, int edgeLen)
+ {
+-    if(!StringUtils::EndsWith(filename, ".spi3d"))
++    if (!StringUtils::EndsWith(filename, ".spi3d"))
+     {
+         std::ostringstream os;
+         os << "Only .spi3d writing is currently supported. ";
+@@ -358,7 +292,7 @@
+ 
+     std::ofstream output;
+     output.open(filename.c_str());
+-    if(!output.is_open())
++    if (!output.is_open())
+     {
+         std::ostringstream os;
+         os <<  "Error opening " << filename << " for writing.";
+@@ -370,11 +304,11 @@
+     output << edgeLen << " " << edgeLen << " " << edgeLen << "\n";
+ 
+     int index = 0;
+-    for(int rindex=0; rindex<edgeLen; ++rindex)
++    for (int rindex=0; rindex<edgeLen; ++rindex)
+     {
+-        for(int gindex=0; gindex<edgeLen; ++gindex)
++        for (int gindex=0; gindex<edgeLen; ++gindex)
+         {
+-            for(int bindex=0; bindex<edgeLen; ++bindex)
++            for (int bindex=0; bindex<edgeLen; ++bindex)
+             {
+                 index = GetLut3DIndex_RedFast(rindex, gindex, bindex,
+                                               edgeLen, edgeLen, edgeLen);
+--- a/src/apputils/CMakeLists.txt
++++ b/src/apputils/CMakeLists.txt
+@@ -2,13 +2,22 @@
+ # Copyright Contributors to the OpenColorIO Project.
+ 
+ set(SOURCES
+-	argparse.cpp
+-	strutil.cpp
++    argparse.cpp
++    strutil.cpp
+ )
+ 
+ add_library(apputils STATIC ${SOURCES})
+ 
+-target_include_directories(apputils PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
++target_include_directories(apputils 
++    PUBLIC
++        ${CMAKE_CURRENT_SOURCE_DIR}/..
++)
++
++target_link_libraries(apputils
++    PRIVATE
++        OpenColorIO
++        pystring::pystring
++)
+ 
+ set_target_properties(apputils PROPERTIES 
+     COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS}"
+--- a/src/libutils/CMakeLists.txt
++++ b/src/libutils/CMakeLists.txt
+@@ -9,8 +9,6 @@
+     add_subdirectory(oglapphelpers)
+ endif()
+ 
+-if(TARGET ocioconvert OR
+-   TARGET ocioperf
+-)
+-    add_subdirectory(oiiohelpers)
++if(TARGET OpenColorIO::ImageIOBackend)
++    add_subdirectory(imageioapphelpers)
+ endif()
+--- /dev/null
++++ b/src/libutils/imageioapphelpers/CMakeLists.txt
+@@ -0,0 +1,49 @@
++# SPDX-License-Identifier: BSD-3-Clause
++# Copyright Contributors to the OpenColorIO Project.
++
++set(SOURCES
++    imageio.cpp
++)
++
++add_library(imageioapphelpers STATIC ${SOURCES})
++set_target_properties(imageioapphelpers PROPERTIES POSITION_INDEPENDENT_CODE ON)
++set_target_properties(imageioapphelpers PROPERTIES OUTPUT_NAME OpenColorIOimageioapphelpers)
++
++if(NOT BUILD_SHARED_LIBS)
++    target_compile_definitions(imageioapphelpers
++        PUBLIC
++            OpenColorIO_SKIP_IMPORTS
++    )
++endif()
++
++set_target_properties(imageioapphelpers PROPERTIES
++    COMPILE_FLAGS "${PLATFORM_COMPILE_FLAGS}"
++)
++
++target_compile_definitions(imageioapphelpers
++    PRIVATE
++        $<$<STREQUAL:"${OCIO_IMAGE_BACKEND}","OpenEXR">:USE_OPENEXR>
++        $<$<STREQUAL:"${OCIO_IMAGE_BACKEND}","OpenImageIO">:USE_OPENIMAGEIO>
++)
++
++target_include_directories(imageioapphelpers
++    PUBLIC
++        ${CMAKE_CURRENT_SOURCE_DIR}
++)
++
++target_link_libraries(imageioapphelpers
++    PUBLIC
++        OpenColorIO::ImageIOBackend
++    PRIVATE
++        OpenColorIO
++        utils::strings
++)
++
++install(TARGETS imageioapphelpers
++    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
++    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
++)
++
++install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/imageio.h
++    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/OpenColorIO/imageioapphelpers
++)
+\ No newline at end of file
+--- /dev/null
++++ b/src/libutils/imageioapphelpers/imageio.cpp
+@@ -0,0 +1,228 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Copyright Contributors to the OpenColorIO Project.
++
++#include <sstream>
++
++#include "imageio.h"
++
++namespace OCIO_NAMESPACE
++{
++
++namespace
++{
++
++const std::vector<std::string> RgbaChans = { "R", "G", "B", "A" };
++const std::vector<std::string> RgbChans  = { "R", "G", "B" };
++
++std::vector<std::string> GetChannelNames(const ChannelOrdering & chanOrder)
++{
++    switch (chanOrder)
++    {
++        case CHANNEL_ORDERING_RGBA:
++            return RgbaChans;
++        case CHANNEL_ORDERING_RGB:
++            return RgbChans;
++        case CHANNEL_ORDERING_BGRA:
++        case CHANNEL_ORDERING_ABGR:
++        case CHANNEL_ORDERING_BGR:
++        default:
++        {
++            std::stringstream ss;
++            ss << "Error: Unsupported channel ordering: " << chanOrder;
++            throw Exception(ss.str().c_str());
++        }
++    }
++}
++
++size_t GetNumChannels(const ChannelOrdering & chanOrder)
++{
++    switch (chanOrder)
++    {
++        case CHANNEL_ORDERING_RGBA:
++            return 4;
++        case CHANNEL_ORDERING_RGB:
++            return 3;
++        case CHANNEL_ORDERING_BGRA:
++        case CHANNEL_ORDERING_ABGR:
++        case CHANNEL_ORDERING_BGR:
++        default:
++        {
++            std::stringstream ss;
++            ss << "Error: Unsupported channel ordering: " << chanOrder;
++            throw Exception(ss.str().c_str());
++        }
++    }
++}
++
++unsigned GetChannelSizeInBytes(BitDepth bitdepth)
++{
++    switch(bitdepth)
++    {
++        case BIT_DEPTH_UINT8:
++            return 1;
++        case BIT_DEPTH_UINT16:
++            return 2;
++        case BIT_DEPTH_F16:
++            return 2;
++        case BIT_DEPTH_F32:
++            return 4;
++        case BIT_DEPTH_UINT10:
++        case BIT_DEPTH_UINT12:
++        case BIT_DEPTH_UINT14:
++        case BIT_DEPTH_UINT32:
++        case BIT_DEPTH_UNKNOWN:
++        default:
++        {
++            std::stringstream ss;
++            ss << "Error: Unsupported bitdepth: " << BitDepthToString(bitdepth);
++            throw Exception(ss.str().c_str());
++        }
++    }
++}
++
++} // anonymous namespace
++
++} // OCIO_NAMESPACE
++
++#ifdef USE_OPENIMAGEIO
++#   include "imageio_oiio.cpp"
++#elif USE_OPENEXR
++#   include "imageio_exr.cpp"
++#else
++#   error "No image backend found to compile ImageIO."
++#endif
++
++namespace OCIO_NAMESPACE
++{
++
++ImageIO::ImageIO()
++: m_impl(new ImageIO::Impl())
++{
++
++}
++
++ImageIO::ImageIO(const std::string & filename)
++: m_impl(new ImageIO::Impl())
++{
++    m_impl->read(filename, BIT_DEPTH_UNKNOWN);
++}
++
++ImageIO::ImageIO(long width, long height, ChannelOrdering chanOrder, BitDepth bitDepth)
++: m_impl(new ImageIO::Impl())
++{
++    m_impl->init(width, height, chanOrder, bitDepth);
++}
++
++ImageIO::~ImageIO()
++{
++    delete m_impl;
++    m_impl = nullptr;
++}
++
++std::string ImageIO::getImageDescStr() const
++{
++    return m_impl->getImageDescStr();
++}
++
++ImageDescRcPtr ImageIO::getImageDesc() const
++{
++    return m_impl->getImageDesc();
++}
++
++uint8_t * ImageIO::getData()
++{
++    return m_impl->getData();
++}
++
++const uint8_t * ImageIO::getData() const
++{
++    return m_impl->getData();
++}
++
++long ImageIO::getWidth() const
++{
++    return m_impl->getWidth();
++}
++
++long ImageIO::getHeight() const
++{
++    return m_impl->getHeight();
++}
++
++BitDepth ImageIO::getBitDepth() const
++{
++    return m_impl->getBitDepth();
++}
++
++long ImageIO::getNumChannels() const
++{
++    return m_impl->getNumChannels();
++}
++
++ChannelOrdering ImageIO::getChannelOrder() const
++{
++    return m_impl->getChannelOrder();
++}
++
++const std::vector<std::string> ImageIO::getChannelNames() const
++{
++    return m_impl->getChannelNames();
++}
++
++ptrdiff_t ImageIO::getChanStrideBytes() const
++{
++    return m_impl->getChanStrideBytes();
++}
++
++ptrdiff_t ImageIO::getXStrideBytes() const
++{
++    return m_impl->getXStrideBytes();
++}
++
++ptrdiff_t ImageIO::getYStrideBytes() const
++{
++    return m_impl->getYStrideBytes();
++}
++
++ptrdiff_t ImageIO::getImageBytes() const
++{
++    return m_impl->getImageBytes();
++}
++
++void ImageIO::init(const ImageIO & img, BitDepth bitDepth)
++{
++    m_impl->init(*img.m_impl, bitDepth);
++}
++
++void ImageIO::init(long width, long height, ChannelOrdering chanOrder, BitDepth bitDepth)
++{
++    m_impl->init(width, height, chanOrder, bitDepth);
++}
++
++void ImageIO::attribute(const std::string & name, const std::string & value)
++{
++    m_impl->attribute(name, value);
++}
++
++void ImageIO::attribute(const std::string & name, float value)
++{
++    m_impl->attribute(name, value);
++}
++
++void ImageIO::attribute(const std::string & name, int value)
++{
++    m_impl->attribute(name, value);
++}
++
++void ImageIO::read(const std::string & filename, BitDepth bitdepth)
++{
++    m_impl->read(filename, bitdepth);
++}
++
++void ImageIO::write(const std::string & filename, BitDepth bitdepth) const
++{
++    m_impl->write(filename, bitdepth);
++}
++
++
++} // namespace OCIO_NAMESPACE
+--- /dev/null
++++ b/src/libutils/imageioapphelpers/imageio.h
+@@ -0,0 +1,84 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Copyright Contributors to the OpenColorIO Project.
++
++#ifndef INCLUDED_OCIO_IMAGEIO_H
++#define INCLUDED_OCIO_IMAGEIO_H
++
++#include <cstddef>
++#include <string>
++#include <vector>
++
++#include "OpenColorIO.h"
++
++namespace OCIO_NAMESPACE
++{
++
++/**
++ * ImageIO provide basic support for image input and output.
++ */
++class ImageIO
++{
++public:
++    static std::string GetVersion();
++
++    ImageIO();
++
++    // Construct and load the image into memory.
++    explicit ImageIO(const std::string & filename);
++
++    // Construct and allocate an empty image buffer.
++    ImageIO(long width, long height, ChannelOrdering chanOrder, BitDepth bitDepth);
++
++    ImageIO(const ImageIO & img) = delete;
++    ImageIO(ImageIO &&) = delete;
++
++    ImageIO & operator = (const ImageIO &) = delete;
++    ImageIO & operator = (ImageIO &&) = delete;
++
++    ~ImageIO();
++
++    // Returns printable information about the image.
++    std::string getImageDescStr() const;
++
++    ImageDescRcPtr getImageDesc() const;
++
++    uint8_t * getData();
++    const uint8_t * getData() const;
++
++    long getWidth() const;
++    long getHeight() const;
++
++    BitDepth getBitDepth() const;
++
++    long getNumChannels() const;
++    ChannelOrdering getChannelOrder() const;
++    const std::vector<std::string> getChannelNames() const;
++
++    ptrdiff_t getChanStrideBytes() const;
++    ptrdiff_t getXStrideBytes() const;
++    ptrdiff_t getYStrideBytes() const;
++    ptrdiff_t getImageBytes() const;
++
++    // Set metadata attributes on the image, depends on format.
++    void attribute(const std::string & name, const std::string & value);
++    void attribute(const std::string & name, float value);
++    void attribute(const std::string & name, int value);
++
++    // Initialize to an empty image buffer.
++    void init(const ImageIO & img, BitDepth bitDepth = BIT_DEPTH_UNKNOWN);
++    void init(long width, long height, ChannelOrdering chanOrder, BitDepth bitDepth);
++
++    // Read or write using the specified bitdepth or the input / current bitdepth.
++    void read(const std::string & filename, BitDepth bitdepth = BIT_DEPTH_UNKNOWN);
++    void write(const std::string & filename, BitDepth bitdepth = BIT_DEPTH_UNKNOWN) const;
++
++private:
++    class Impl;
++    Impl * m_impl;
++    Impl * getImpl() { return m_impl; }
++    const Impl * getImpl() const { return m_impl; }
++};
++
++} // namespace OCIO_NAMESPACE
++
++#endif // INCLUDED_OCIO_IMAGEIO_H
+--- /dev/null
++++ b/src/libutils/imageioapphelpers/imageio_exr.cpp
+@@ -0,0 +1,416 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Copyright Contributors to the OpenColorIO Project.
++
++#include <sstream>
++
++#include <ImfArray.h>
++#include <ImfFrameBuffer.h>
++#include <ImfChannelList.h>
++#include <ImfPixelType.h>
++#include <ImfHeader.h>
++#include <ImfInputFile.h>
++#include <ImfOutputFile.h>
++#include <ImfFloatAttribute.h>
++#include <ImfIntAttribute.h>
++#include <ImfMatrixAttribute.h>
++#include <ImfStringAttribute.h>
++
++
++namespace OCIO_NAMESPACE
++{
++
++namespace
++{
++
++BitDepth BitDepthFromPixelType(Imf::PixelType type)
++{
++    switch (type)
++    {
++        case Imf::HALF:  return BIT_DEPTH_F16;
++        case Imf::FLOAT: return BIT_DEPTH_F32;
++        case Imf::UINT:
++        case Imf::NUM_PIXELTYPES:
++        default:
++        {
++            std::stringstream ss;
++            ss << "Error: Unsupported pixel type: " << type;
++            throw Exception(ss.str().c_str());
++        }
++    }
++}
++
++Imf::PixelType BitDepthToPixelType(BitDepth bitdepth)
++{
++    switch (bitdepth)
++    {
++        case BIT_DEPTH_F16:     return Imf::HALF;
++        case BIT_DEPTH_F32:     return Imf::FLOAT;
++        case BIT_DEPTH_UNKNOWN:
++        case BIT_DEPTH_UINT8:
++        case BIT_DEPTH_UINT10:
++        case BIT_DEPTH_UINT12:
++        case BIT_DEPTH_UINT14:
++        case BIT_DEPTH_UINT16:
++        case BIT_DEPTH_UINT32:
++        default:
++        {
++            std::stringstream ss;
++            ss << "Error: Unsupported bitdepth: " << BitDepthToString(bitdepth);
++            throw Exception(ss.str().c_str());
++        }
++    }
++}
++
++} // anonymous namespace
++
++std::string ImageIO::GetVersion()
++{
++    std::ostringstream ss;
++    ss << "OpenEXR Version: " << OPENEXR_LIB_VERSION_STRING;
++    return ss.str();
++}
++
++class ImageIO::Impl
++{
++public:
++    Imf::Header m_header;
++    std::vector<uint8_t> m_data;
++
++    Impl() = default;
++
++    Impl(const Impl &) = delete;
++    Impl(Impl &&) = delete;
++
++    Impl& operator= (const Impl & rhs) = delete;
++    Impl& operator= (Impl && rhs) = delete;
++
++    ~Impl() = default;
++
++    std::string getImageDescStr() const
++    {
++        std::ostringstream ss;
++
++        ss << std::endl;
++        ss << "Image: [" << getWidth() << "x" << getHeight() << "] "
++           << BitDepthToString(getBitDepth()) << " ";
++
++        const std::vector<std::string> chanNames = getChannelNames();
++        for (int i = 0; i < getNumChannels(); ++i)
++        {
++            if (i < (int)chanNames.size())
++            {
++                ss << chanNames[i];
++            }
++            else
++            {
++                ss << "Unknown";
++            }
++
++            if (i < (getNumChannels() - 1))
++            {
++                ss << ", ";
++            }
++        }
++        ss << std::endl;
++
++        return ss.str();
++    }
++
++    ImageDescRcPtr getImageDesc() const
++    {
++        return std::make_shared<PackedImageDesc>(
++            (void*) getData(),
++            getWidth(),
++            getHeight(),
++            getChannelOrder(),
++            getBitDepth(),
++            getChanStrideBytes(),
++            getXStrideBytes(),
++            getYStrideBytes()
++        );
++    }
++
++    uint8_t * getData()
++    {
++        return m_data.data();
++    }
++
++    const uint8_t * getData() const
++    {
++        return m_data.data();
++    }
++
++    long getWidth() const
++    {
++        const Imath::Box2i & dw = m_header.dataWindow();
++        return (long)(dw.max.x - dw.min.x + 1);
++    }
++
++    long getHeight() const
++    {
++        const Imath::Box2i & dw = m_header.dataWindow();
++        return (long)(dw.max.y - dw.min.y + 1);
++    }
++
++    BitDepth getBitDepth() const
++    {
++        const Imf::ChannelList & channels = m_header.channels();
++        if (channels.begin() != channels.end())
++        {
++            return BitDepthFromPixelType(channels.begin().channel().type);
++        }
++        else
++        {
++            return BIT_DEPTH_UNKNOWN;
++        }
++    }
++
++    long getNumChannels() const
++    {
++        long channel_count = 0;
++        const Imf::ChannelList & channels = m_header.channels();
++        for (auto it = channels.begin(); it != channels.end(); ++it)
++        {
++            ++channel_count;
++        }
++        return channel_count;
++    }
++
++    ChannelOrdering getChannelOrder() const
++    {
++        if (getNumChannels() == 4)
++        {
++            return CHANNEL_ORDERING_RGBA;
++        }
++        else
++        {
++            return CHANNEL_ORDERING_RGB;
++        }
++    }
++
++    const std::vector<std::string> getChannelNames() const
++    {
++        return GetChannelNames(getChannelOrder());
++    }
++
++    ptrdiff_t getChanStrideBytes() const
++    {
++        return GetChannelSizeInBytes(getBitDepth());
++    }
++
++    ptrdiff_t getXStrideBytes() const
++    {
++        return getNumChannels() * getChanStrideBytes();
++    }
++
++    ptrdiff_t getYStrideBytes() const
++    {
++        return getWidth() * getXStrideBytes();
++    }
++
++    ptrdiff_t getImageBytes() const
++    {
++        return getYStrideBytes() * getHeight();
++    }
++
++    void attribute(const std::string & name, const std::string & value)
++    {
++        m_header.insert(name, Imf::StringAttribute(value));
++    }
++
++    void attribute(const std::string & name, float value)
++    {
++        m_header.insert(name, Imf::FloatAttribute(value));
++    }
++
++    void attribute(const std::string & name, int value)
++    {
++        m_header.insert(name, Imf::IntAttribute(value));
++    }
++
++    void init(const ImageIO::Impl & img, BitDepth bitDepth)
++    {
++        bitDepth = bitDepth == BIT_DEPTH_UNKNOWN ? img.getBitDepth() : bitDepth;
++
++        const size_t numChans = img.getNumChannels();
++        const size_t bitDepthBytes = GetChannelSizeInBytes(bitDepth);
++        const size_t imgSizeInBytes =
++            bitDepthBytes * numChans * (size_t)(img.getWidth() * img.getHeight());
++
++        m_data.resize(imgSizeInBytes, 0);
++
++        m_header = img.m_header;
++
++        m_header.channels() = Imf::ChannelList();
++
++        Imf::PixelType pixelType = BitDepthToPixelType(bitDepth);
++        for (auto name : GetChannelNames(img.getChannelOrder()))
++        {
++            m_header.channels().insert(name, Imf::Channel(pixelType));
++        }
++    }
++
++    void init(long width, long height, ChannelOrdering chanOrder, BitDepth bitDepth)
++    {
++        const size_t numChans = GetNumChannels(chanOrder);
++        const size_t bitDepthBytes = GetChannelSizeInBytes(bitDepth);
++        const size_t imgSizeInBytes = bitDepthBytes * numChans * (size_t)(width * height);
++
++        m_data.resize(imgSizeInBytes, 0);
++
++        m_header = Imf::Header();
++
++        m_header.dataWindow().min.x = 0;
++        m_header.dataWindow().min.y = 0;
++        m_header.dataWindow().max.x = (int)width - 1;
++        m_header.dataWindow().max.y = (int)height - 1;
++
++        m_header.displayWindow().min.x = 0;
++        m_header.displayWindow().min.y = 0;
++        m_header.displayWindow().max.x = (int)width - 1;
++        m_header.displayWindow().max.y = (int)height - 1;
++
++        Imf::PixelType pixelType = BitDepthToPixelType(bitDepth);
++        for (auto name : GetChannelNames(chanOrder))
++        {
++            m_header.channels().insert(name, Imf::Channel(pixelType));
++        }
++    }
++
++    void read(const std::string & filename, BitDepth bitdepth)
++    {
++        Imf::InputFile file(filename.c_str());
++
++        // Detect channels, RGB channels are required at a minimum. If channels
++        // R, G, and B don't exist, they will be created and zero filled.
++        // Except for Alpha, no other channel are preserved.
++        const Imf::ChannelList & chanList = file.header().channels();
++
++        ChannelOrdering chanOrder = CHANNEL_ORDERING_RGB;
++        if (chanList.findChannel(RgbaChans[3]))
++        {
++            chanOrder = CHANNEL_ORDERING_RGBA;
++        }
++
++        // Detect pixel type, support only 16 or 32 bits floating point. All
++        // channels will be converted to the same type if required.
++        Imf::PixelType pixelType = Imf::HALF;
++
++        // Use the specified bitdepth as requested.
++        if (bitdepth != BIT_DEPTH_UNKNOWN)
++        {
++            pixelType = BitDepthToPixelType(bitdepth);
++        }
++        // Start with the minimum supported bit-depth and increase to match the
++        // channel with the largest pixel type.
++        else
++        {
++            for (const auto & name : RgbaChans)
++            {
++                auto chan = chanList.findChannel(name);
++                if (chan && chan->type == Imf::FLOAT)
++                {
++                    pixelType = Imf::FLOAT;
++                    break;
++                }
++            }
++        }
++
++        // Allocate buffer for image data
++        const Imath::Box2i & dw = file.header().dataWindow();
++        const long width  = (long)(dw.max.x - dw.min.x + 1);
++        const long height = (long)(dw.max.y - dw.min.y + 1);
++        init(width, height, chanOrder, BitDepthFromPixelType(pixelType));
++
++        // Copy existing attributes, except for channels which we force to
++        // RGB or RGBA of the derived pixel type.
++        Imf::Header::ConstIterator attrIt = file.header().begin();
++        for (; attrIt != file.header().end(); attrIt++)
++        {
++            if (std::string(attrIt.name()) == "channels")
++            {
++                continue;
++            }
++
++            m_header.insert(attrIt.name(), attrIt.attribute());
++        }
++
++        // Read pixels into buffer
++        const size_t x          = (size_t)dw.min.x;
++        const size_t y          = (size_t)dw.min.y;
++        const size_t chanStride = (size_t)getChanStrideBytes();
++        const size_t xStride    = (size_t)getXStrideBytes();
++        const size_t yStride    = (size_t)getYStrideBytes();
++
++        Imf::FrameBuffer frameBuffer;
++
++        const std::vector<std::string> chanNames = getChannelNames();
++        for (size_t i = 0; i < chanNames.size(); i++)
++        {
++            frameBuffer.insert(
++                chanNames[i],
++                Imf::Slice(
++                    pixelType,
++                    (char *)(getData() - x*xStride - y*yStride + i*chanStride),
++                    xStride, yStride,
++                    1, 1,
++                    // RGB default to 0.0, A default to 1.0
++                    (i == 3 ? 1.0 : 0.0)
++                )
++            );
++        }
++
++        file.setFrameBuffer(frameBuffer);
++        file.readPixels(dw.min.y, dw.max.y);
++    }
++
++    void write(const std::string & filename, BitDepth bitdepth)
++    {
++        Imf::Header header(m_header);
++
++        Imf::OutputFile file(filename.c_str(), header);
++
++        const Imath::Box2i & dw = header.dataWindow();
++        const size_t x          = (size_t)dw.min.x;
++        const size_t y          = (size_t)dw.min.y;
++        const size_t chanStride = (size_t)getChanStrideBytes();
++        const size_t xStride    = (size_t)getXStrideBytes();
++        const size_t yStride    = (size_t)getYStrideBytes();
++
++        const std::vector<std::string> chanNames = getChannelNames();
++
++        Imf::PixelType pixelType;
++        // Use the specified bitdepth as requested.
++        if (bitdepth != BIT_DEPTH_UNKNOWN)
++        {
++            pixelType = BitDepthToPixelType(bitdepth);
++        }
++        else
++        {
++            pixelType = BitDepthToPixelType(getBitDepth());
++        }
++
++        Imf::FrameBuffer frameBuffer;
++
++        for (size_t i = 0; i < chanNames.size(); i++)
++        {
++            frameBuffer.insert(
++                chanNames[i],
++                Imf::Slice(
++                    pixelType,
++                    (char *)(getData() - x*xStride - y*yStride + i*chanStride),
++                    xStride, yStride,
++                    1, 1,
++                    // RGB default to 0.0, A default to 1.0
++                    (i == 3 ? 1.0 : 0.0)
++                )
++            );
++        }
++
++        file.setFrameBuffer(frameBuffer);
++        file.writePixels(getHeight());
++    }
++
++};
++
++} // namespace OCIO_NAMESPACE
+--- /dev/null
++++ b/src/libutils/imageioapphelpers/imageio_oiio.cpp
+@@ -0,0 +1,270 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Copyright Contributors to the OpenColorIO Project.
++
++#include <sstream>
++
++#include <OpenImageIO/imagebuf.h>
++#include <OpenImageIO/imagebufalgo.h>
++
++
++namespace OCIO_NAMESPACE
++{
++
++namespace
++{
++
++BitDepth BitDepthFromTypeDesc(OIIO::TypeDesc type)
++{
++    switch (type.basetype)
++    {
++        case OIIO::TypeDesc::UINT8:     return BIT_DEPTH_UINT8;
++        case OIIO::TypeDesc::UINT16:    return BIT_DEPTH_UINT16;
++        case OIIO::TypeDesc::HALF:      return BIT_DEPTH_F16;
++        case OIIO::TypeDesc::FLOAT:     return BIT_DEPTH_F32;
++        case OIIO::TypeDesc::UNKNOWN:
++        case OIIO::TypeDesc::NONE:
++        case OIIO::TypeDesc::INT8:
++        case OIIO::TypeDesc::INT16:
++        case OIIO::TypeDesc::UINT32:
++        case OIIO::TypeDesc::INT32:
++        case OIIO::TypeDesc::UINT64:
++        case OIIO::TypeDesc::INT64:
++        case OIIO::TypeDesc::DOUBLE:
++        case OIIO::TypeDesc::STRING:
++        case OIIO::TypeDesc::PTR:
++        case OIIO::TypeDesc::LASTBASE:
++        default:
++        {
++            std::stringstream ss;
++            ss << "Error: Unsupported type desc: " << type;
++            throw Exception(ss.str().c_str());
++        }
++    }
++}
++
++OIIO::TypeDesc BitDepthToTypeDesc(BitDepth bitdepth)
++{
++    switch (bitdepth)
++    {
++        case BIT_DEPTH_UINT8:   return OIIO::TypeDesc(OIIO::TypeDesc::UINT8);
++        case BIT_DEPTH_UINT16:  return OIIO::TypeDesc(OIIO::TypeDesc::UINT16);
++        case BIT_DEPTH_F16:     return OIIO::TypeDesc(OIIO::TypeDesc::HALF);
++        case BIT_DEPTH_F32:     return OIIO::TypeDesc(OIIO::TypeDesc::FLOAT);
++        case BIT_DEPTH_UNKNOWN: return OIIO::TypeDesc(OIIO::TypeDesc::UNKNOWN);
++        case BIT_DEPTH_UINT10:
++        case BIT_DEPTH_UINT12:
++        case BIT_DEPTH_UINT14:
++        case BIT_DEPTH_UINT32:
++        default:
++        {
++            std::stringstream ss;
++            ss << "Error: Unsupported bitdepth: " << BitDepthToString(bitdepth);
++            throw Exception(ss.str().c_str());
++        }
++    }
++}
++
++} // anonymous namespace
++
++std::string ImageIO::GetVersion()
++{
++    std::ostringstream ss;
++    ss << "OpenImageIO Version: " << OIIO_VERSION_STRING;
++    return ss.str();
++}
++
++class ImageIO::Impl
++{
++public:
++    OIIO::ImageBuf m_buffer;
++
++    Impl() = default;
++
++    Impl(const Impl &) = delete;
++    Impl(Impl &&) = delete;
++
++    Impl& operator= (const Impl & rhs) = delete;
++    Impl& operator= (Impl && rhs) = delete;
++
++    ~Impl() = default;
++
++    std::string getImageDescStr() const
++    {
++        std::ostringstream ss;
++
++        ss << std::endl;
++        ss << "Image: [" << getWidth() << "x" << getHeight() << "] "
++           << BitDepthToString(getBitDepth()) << " ";
++
++        const std::vector<std::string> chanNames = getChannelNames();
++        for (int i = 0; i < getNumChannels(); ++i)
++        {
++            if (i < (int)chanNames.size())
++            {
++                ss << chanNames[i];
++            }
++            else
++            {
++                ss << "Unknown";
++            }
++
++            if (i < (getNumChannels() - 1))
++            {
++                ss << ", ";
++            }
++        }
++        ss << std::endl;
++
++        return ss.str();
++    }
++
++    ImageDescRcPtr getImageDesc() const
++    {
++        return std::make_shared<PackedImageDesc>(
++            (void*) getData(),
++            getWidth(),
++            getHeight(),
++            getChannelOrder(),
++            getBitDepth(),
++            getChanStrideBytes(),
++            getXStrideBytes(),
++            getYStrideBytes()
++        );
++    }
++
++    uint8_t * getData()
++    {
++        return (uint8_t*) m_buffer.localpixels();
++    }
++
++    const uint8_t * getData() const
++    {
++        return (const uint8_t*) m_buffer.localpixels();
++    }
++
++    long getWidth() const
++    {
++        return m_buffer.spec().width;
++    }
++
++    long getHeight() const
++    {
++        return m_buffer.spec().height;
++    }
++
++    BitDepth getBitDepth() const
++    {
++        return BitDepthFromTypeDesc(m_buffer.spec().format);
++    }
++
++    long getNumChannels() const
++    {
++        return m_buffer.spec().nchannels;
++    }
++
++    ChannelOrdering getChannelOrder() const
++    {
++        if (getNumChannels() == 4)
++        {
++            return CHANNEL_ORDERING_RGBA;
++        }
++        else
++        {
++            return CHANNEL_ORDERING_RGB;
++        }
++    }
++
++    const std::vector<std::string> getChannelNames() const
++    {
++        return GetChannelNames(getChannelOrder());
++    }
++
++    ptrdiff_t getChanStrideBytes() const
++    {
++        return GetChannelSizeInBytes(getBitDepth());
++    }
++
++    ptrdiff_t getXStrideBytes() const
++    {
++        return getNumChannels() * getChanStrideBytes();
++    }
++
++    ptrdiff_t getYStrideBytes() const
++    {
++        return getWidth() * getXStrideBytes();
++    }
++
++    ptrdiff_t getImageBytes() const
++    {
++        return getYStrideBytes() * getHeight();
++    }
++
++    void attribute(const std::string & name, const std::string & value)
++    {
++        m_buffer.specmod().attribute(name, value);
++    }
++
++    void attribute(const std::string & name, float value)
++    {
++        m_buffer.specmod().attribute(name, value);
++    }
++
++    void attribute(const std::string & name, int value)
++    {
++        m_buffer.specmod().attribute(name, value);
++    }
++
++    void init(const ImageIO::Impl & img, BitDepth bitDepth)
++    {
++        bitDepth = bitDepth == BIT_DEPTH_UNKNOWN ? img.getBitDepth() : bitDepth;
++
++        OIIO::ImageSpec spec = img.m_buffer.spec();
++        spec.format = BitDepthToTypeDesc(bitDepth);
++
++        m_buffer = OIIO::ImageBuf(spec);
++    }
++
++    void init(long width, long height, ChannelOrdering chanOrder, BitDepth bitDepth)
++    {
++        OIIO::ImageSpec spec(
++            width, height,
++            GetNumChannels(chanOrder),
++            BitDepthToTypeDesc(bitDepth));
++
++        m_buffer = OIIO::ImageBuf(spec);
++    }
++
++    void read(const std::string & filename, BitDepth bitdepth)
++    {
++        const OIIO::TypeDesc typeDesc = BitDepthToTypeDesc(bitdepth);
++
++        m_buffer = OIIO::ImageBuf(filename);
++
++        if (!m_buffer.read(
++                0,              // subimage
++                0,              // miplevel
++                true,           // force immediate read
++                typeDesc        // convert to type
++        ))
++        {
++            std::stringstream ss;
++            ss << "Error: Could not read image: " << m_buffer.geterror();
++            throw Exception(ss.str().c_str());
++        }
++    }
++
++    void write(const std::string & filename, BitDepth bitdepth)
++    {
++        const OIIO::TypeDesc typeDesc = BitDepthToTypeDesc(bitdepth);
++
++        if (!m_buffer.write(filename, typeDesc))
++        {
++            std::stringstream ss;
++            ss << "Error: Could not write image: " << m_buffer.geterror();
++            throw Exception(ss.str().c_str());
++        }
++    }
++
++};
++
++} // namespace OCIO_NAMESPACE

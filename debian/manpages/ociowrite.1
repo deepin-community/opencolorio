@@ -1,0 +1,51 @@
+.TH OCIOWRITE "1" "August 2022" "ociowrite -- write a color transformation to a file" "User Commands"
+.SH NAME
+ociowrite \- write a color transformation to a file
+.SH DESCRIPTION
+ociowrite \fB\-\-\fR write a color transformation to a file
+.PP
+usage: ociowrite [options] \fB\-\-file\fR outputfile
+.TP
+\fB\-\-h\fR
+Display the help and exit
+.TP
+\fB\-\-v\fR
+Display some general information
+.TP
+\fB\-\-colorspaces\fR %s %s
+Provide the input and output color spaces
+.TP
+\fB\-\-displayview\fR %s %s %s
+Provide the input and (display, view) pair
+.TP
+\fB\-\-file\fR %s
+Transform file path. Format is implied by extension. Formats to write to: ColorCorrection (.cc), ColorCorrectionCollection (.ccc), ColorDecisionList (.cdl), Academy/ASC Common LUT Format (.clf), Color Transform Format (.ctf)
+.PP
+usage: ociowrite [options] \fB\-\-file\fR outputfile
+.TP
+\fB\-\-h\fR
+Display the help and exit
+.TP
+\fB\-\-v\fR
+Display some general information
+.TP
+\fB\-\-colorspaces\fR %s %s
+Provide the input and output color spaces
+.TP
+\fB\-\-displayview\fR %s %s %s
+Provide the input and (display, view) pair
+.TP
+\fB\-\-file\fR %s
+Transform file path. Format is implied by extension. Formats to write to: ColorCorrection (.cc), ColorCorrectionCollection (.ccc), ColorDecisionList (.cdl), Academy/ASC Common LUT Format (.clf), Color Transform Format (.ctf)
+.SH "SEE ALSO"
+The full documentation for
+.B ociowrite
+is maintained as a Texinfo manual.  If the
+.B info
+and
+.B ociowrite
+programs are properly installed at your site, the command
+.IP
+.B info ociowrite
+.PP
+should give you access to the complete manual.
